@@ -82,22 +82,23 @@ jobs:
             const imageRef = `${registry}/${repoLower}:${version}`;
             const digest = '${{ steps.build.outputs.digest }}';
 
-            const dockerSection = `
+            const tableRows = [
+              '| 属性 | 值 |',
+              '|------|-----|',
+              '| 镜像地址 | `' + imageRef + '` |',
+              '| Digest | `' + digest + '` |',
+            ].join('\n');
 
-## Docker Image
+            const pullCommands = [
+              'docker pull ' + imageRef,
+              '# 或通过 digest 拉取（推荐，确保内容一致）',
+              'docker pull ' + registry + '/' + repoLower + '@' + digest,
+            ].join('\n');
 
-| 属性 | 值 |
-|------|-----|
-| 镜像地址 | \`${imageRef}\` |
-| Digest | \`${digest}\` |
-
-**拉取镜像：**
-\`\`\`bash
-docker pull ${imageRef}
-# 或通过 digest 拉取（推荐，确保内容一致）
-docker pull ${registry}/${repoLower}@${digest}
-\`\`\`
-`;
+            const dockerSection = '\n\n## Docker Image\n\n' +
+              tableRows + '\n\n' +
+              '**拉取镜像：**\n' +
+              '```bash\n' + pullCommands + '\n```\n';
 
             const existingBody = release.body || '';
             const updatedBody = existingBody + dockerSection;
