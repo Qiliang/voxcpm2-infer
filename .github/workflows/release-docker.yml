@@ -7,6 +7,8 @@ on:
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
+  # vllm-openai 镜像内置 CUDA，需固定 linux/amd64（CUDA 不支持 ARM）
+  BASE_IMAGE: vllm/vllm-openai:v0.20.0
 
 jobs:
   build-and-push:
@@ -49,6 +51,9 @@ jobs:
           context: .
           file: docker/Dockerfile
           push: true
+          # CUDA 镜像仅支持 linux/amd64，不构建多平台
+          platforms: linux/amd64
+          build-args: BASE_IMAGE=${{ env.BASE_IMAGE }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
@@ -82,11 +87,14 @@ jobs:
             const imageRef = `${registry}/${repoLower}:${version}`;
             const digest = '${{ steps.build.outputs.digest }}';
 
+            const baseImage = '${{ env.BASE_IMAGE }}';
             const tableRows = [
               '| 属性 | 值 |',
               '|------|-----|',
               '| 镜像地址 | `' + imageRef + '` |',
               '| Digest | `' + digest + '` |',
+              '| 基础镜像 | `' + baseImage + '` (CUDA) |',
+              '| 平台 | `linux/amd64` |',
             ].join('\n');
 
             const pullCommands = [
