@@ -22,7 +22,7 @@ COPY vllm_omni/entrypoints/openai/serving_speech_stream.py \
 
 # Step 4: Install vllm-omni with patches applied
 RUN cd ${COMMON_WORKDIR}/vllm-omni && uv pip install --python "$(python3 -c 'import sys; print(sys.executable)')" --no-cache-dir "."
-RUN uv sync --no-cache-dir
+RUN uv pip install voxcpm>=2.0.2 --no-cache-dir
 RUN ln -sf /usr/bin/python3 /usr/bin/python
 
 ENTRYPOINT []
