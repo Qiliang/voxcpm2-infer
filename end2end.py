@@ -18,7 +18,7 @@ from vllm_omni import Omni
 from vllm_omni.engine.arg_utils import nullify_stage_engine_defaults
 
 REPO_ROOT = Path(__file__).resolve().parent
-DEFAULT_STAGE_CONFIGS_PATH = str(REPO_ROOT / "vllm_omni" / "model_executor" / "stage_configs" / "voxcpm2.yaml")
+DEFAULT_STAGE_CONFIGS_PATH = str(REPO_ROOT / "voxcpm2.yaml")
 SAMPLE_RATE = 48_000
 
 

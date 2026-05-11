@@ -309,6 +309,7 @@ def create_app(api_base: str):
             content = await resp.aread()
             await resp.aclose()
             await client.aclose()
+            logger.error("Proxy upstream error %s: %s", resp.status_code, content.decode(errors="replace"))
             return Response(content=content, status_code=resp.status_code)
 
         async def relay():
@@ -511,8 +512,8 @@ def create_app(api_base: str):
 
             payload: dict = {
                 "input": final_text,
-                "voice": "default",
                 "response_format": "pcm" if stream_enabled else "wav",
+                "seed":42,
                 "stream": stream_enabled,
             }
 
@@ -582,7 +583,7 @@ def create_app(api_base: str):
 
 def main():
     parser = argparse.ArgumentParser(description="VoxCPM2 streaming Gradio demo")
-    parser.add_argument("--api-base", default="http://localhost:8000", help="vLLM API server URL")
+    parser.add_argument("--api-base", default="http://172.16.52.65:8010", help="vLLM API server URL")
     parser.add_argument("--host", default="0.0.0.0", help="Gradio server host")
     parser.add_argument("--port", type=int, default=7860, help="Gradio server port")
     args = parser.parse_args()
