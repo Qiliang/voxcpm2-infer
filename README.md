@@ -1,0 +1,58 @@
+
+使用WeTextProcessing
+text = "您好，欢迎致电合力亿捷，您在深圳市福田区人民法院的（2026）粤0307民初2394号知识产权纠纷案件，已依法向您预留的邮箱982145926@qq.com送达相关法律文书。您的身份证号后四位是1301。法院位置是朝南出发，经过银行后步行100米。价格是1988。您看还有什么问题？欢迎和我沟通，我随时为您服务，再见"
+zh_tn_model.normalize(text)
+output:
+```text
+您好,欢迎致电合力亿捷,您在深圳市福田区人民法院的(两千零二十六)粤零三零七民初两千三百九十四号知识产权纠纷案件,已依法向您预留的邮箱九八二幺四五九二六@qq.com送达相关法律文书.您的身份证号后四位是一千三百零一.法院位置是朝南出发,经过银行后步行一百米.价格是一千九百八十八.您看还有什么问题?欢迎和我沟通,我随时为您服务,再见
+```
+其中“人民法院的（2026）”转换成了“人民法院的(两千零二十六)”能不能通过自定义规则来实现”转换成“人民法院的(二零二六)”？
+
+
+
+
+ voice-clone/pretrained_models/
+
+docker run -it --rm --gpus all -v /home/dev/xql/voxcpm2_infer:/infer \
+-p 8010:8010 \
+-v /home/dev/xql/voxcpm2-lora/pretrained_models:/pretrained_models \
+ghcr.io/qiliang/voxcpm2-infer:0.1.5 bash
+
+
+
+vllm serve \
+    /pretrained_models/VoxCPM2-lora008-merged/ \
+    --served-model-name VoxCPM2 \
+    --host 0.0.0.0 \
+    --port 8010 \
+    --omni \
+    --stage-configs-path /infer/voxcpm2.yaml \
+    --trust-remote-code \
+    --seed 42
+
+
+python end2end.py --model /pretrained_models/VoxCPM2 \
+--text "您好，欢迎致电合力亿捷，您在深圳市福田区人民法院的（2026）粤0307民初2394号知识产权纠纷案件，已依法向您预留的邮箱982145926@qq.com送达相关法律文书。您的身份证号后四位是1301。法院位置是朝南出发，经过银行后步行100米。价格是1988。您看还有什么问题？欢迎和我沟通，我随时为您服务，再见" \
+--output-dir /infer/output_audio
+
+
+复刻声音
+vllm-omni.tools.create_voice_profile \
+    --model /pretrained_models/VoxCPM2 \
+    --audio 合力咨询_赵娜.mp3 \
+    --text "$(cat 合力咨询_赵娜.txt)" \
+    --output_name "vip_voice_001"
+
+
+您好，欢迎致电合力亿捷，您在深圳市福田区人民法院的（2026）粤0307民初2394号知识产权纠纷案件，已依法向您预留的邮箱982145926@qq.com送达相关法律文书。您的身份证号后四位是1301。法院位置是朝南出发，经过银行后步行100米。价格是1988元。您看还有什么问题？欢迎和我沟通，我随时为您服务，再见
+
+
+# 基准测试
+vllm bench serve \
+  --backend openai-audio \
+  --base-url http://localhost:8010 \
+  --dataset-name random-mm \
+  --num-prompts 50 \
+  --max-concurrency 10 \
+  --request-rate 2 \
+  --percentile-metrics "ttft,audio_ttfp,audio_rtf"
