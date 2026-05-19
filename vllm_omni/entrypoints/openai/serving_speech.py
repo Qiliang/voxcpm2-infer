@@ -94,25 +94,257 @@ _TTS_LANGUAGES: set[str] = {
     "Italian",
 }
 _REF_AUDIO_MIN_DURATION = 1.0  # seconds
-_REF_AUDIO_MAX_DURATION = 30.0  # seconds
+_REF_AUDIO_MAX_DURATION = float(os.environ.get("REF_AUDIO_MAX_DURATION", "30.0"))  # seconds
 _TTS_MAX_INSTRUCTIONS_LENGTH = 500
 _TTS_MAX_NEW_TOKENS_MIN = 1
 _TTS_MAX_NEW_TOKENS_MAX = 4096
 
 # ── [PATCH] Output sample rate ────────────────────────────────────────────────
-_OUTPUT_SAMPLE_RATE = 8000
+ENABLE_RESAMPLE = os.environ.get("ENABLE_RESAMPLE", "true") == "true"
+_OUTPUT_SAMPLE_RATE = 16000
 
 
 def _resample_audio(audio_np: np.ndarray, orig_sr: int, target_sr: int) -> np.ndarray:
-    """Resample audio from orig_sr to target_sr using scipy polyphase filter.
+    """One-shot resample (non-streaming).
 
-    [PATCH] Added to downsample model output (48 kHz) to _OUTPUT_SAMPLE_RATE.
+    [PATCH] Used by non-streaming paths that already hold the full waveform.
+    Uses soxr when available; falls back to scipy resample_poly with linear
+    edge extrapolation and amplitude clipping to avoid PCM overflow.
     """
     if orig_sr == target_sr or audio_np.size == 0:
         return audio_np
+    try:
+        import soxr  # type: ignore
+        return soxr.resample(audio_np, orig_sr, target_sr, quality="HQ").astype(np.float32)
+    except ImportError:
+        pass
     from scipy.signal import resample_poly
     g = math.gcd(orig_sr, target_sr)
-    return resample_poly(audio_np, target_sr // g, orig_sr // g).astype(np.float32)
+    resampled = resample_poly(audio_np, target_sr // g, orig_sr // g, padtype="line").astype(np.float32)
+    return np.clip(resampled, -1.0, 1.0)
+
+
+class _StreamingResampler:
+    """Stateful resampler for chunked streaming output.
+
+    Resampling each engine chunk independently with a polyphase FIR (scipy
+    `resample_poly`) leaves a filter transient at both edges of every chunk.
+    Concatenating those chunks produces audible clicks/"ticks" at the seams
+    (most noticeable at high chunk frequency, e.g. 48 kHz -> 16 kHz with
+    short VAE outputs).
+
+    This class preserves continuity across chunks:
+      * Preferred backend: ``soxr.ResampleStream`` (true stateful resampler,
+        no boundary artifacts and no sub-sample phase drift).
+      * Fallback backend: ``scipy.signal.resample_poly`` with input
+        overlap-discard buffering — keeps the last ``ctx_in`` input samples
+        of the previous chunk as context for the next call so the filter is
+        already in steady state at the seam.
+    """
+
+    def __init__(self, orig_sr: int, target_sr: int) -> None:
+        self._orig_sr = int(orig_sr)
+        self._target_sr = int(target_sr)
+        self._passthrough = self._orig_sr == self._target_sr
+        self._soxr_stream = None
+        self._scipy_resample_poly = None
+        # scipy fallback state: sliding input buffer in absolute stream
+        # coordinates plus the count of output samples already emitted.
+        # Tracking the absolute input position of the buffer's first sample
+        # lets us emit a strict prefix of the one-shot resample_poly output
+        # grid even when individual input chunk sizes are not multiples of
+        # ``self._down``.
+        self._scipy_in_buf: np.ndarray = np.zeros(0, dtype=np.float32)
+        self._scipy_in_buf_start_abs: int = 0
+        self._scipy_emitted_out: int = 0
+        self._scipy_started = False
+        self._up = 1
+        self._down = 1
+        self._ctx_in = 0
+        self._tail_in = 0
+
+        if self._passthrough:
+            return
+
+        # Prefer soxr's stateful streaming resampler when available.
+        try:
+            import soxr  # type: ignore
+
+            self._soxr_stream = soxr.ResampleStream(
+                self._orig_sr,
+                self._target_sr,
+                1,
+                dtype="float32",
+                quality="HQ",
+            )
+        except Exception:
+            self._soxr_stream = None
+
+        if self._soxr_stream is None:
+            try:
+                from scipy.signal import resample_poly  # type: ignore
+
+                self._scipy_resample_poly = resample_poly
+                g = math.gcd(self._orig_sr, self._target_sr)
+                self._up = self._target_sr // g
+                self._down = self._orig_sr // g
+                # Polyphase prototype FIR support in input-sample domain.
+                # scipy resample_poly default has ~20 * max(up, down) taps in
+                # the upsampled domain → ~20 * max(up, down) / up input
+                # samples of support per output sample.
+                filter_in_support = max(
+                    1, (20 * max(self._up, self._down) + self._up - 1) // self._up
+                )
+                # Past context and future lookahead must both be multiples
+                # of ``self._down`` so that all per-call output-sample index
+                # computations stay exact integers and emissions stay locked
+                # to the one-shot resample sample grid.
+                target_ctx = max(filter_in_support * 4, 256)
+                self._ctx_in = (
+                    (target_ctx + self._down - 1) // self._down
+                ) * self._down
+                target_tail = max(filter_in_support, 32)
+                self._tail_in = (
+                    (target_tail + self._down - 1) // self._down
+                ) * self._down
+            except ImportError:
+                self._scipy_resample_poly = None
+
+    @property
+    def target_sr(self) -> int:
+        return self._target_sr
+
+    def process(self, audio_np: np.ndarray) -> np.ndarray:
+        """Resample one streamed input chunk; returns the chunk's output samples."""
+        if audio_np is None or audio_np.size == 0:
+            return np.zeros(0, dtype=np.float32)
+        x = np.ascontiguousarray(audio_np, dtype=np.float32)
+        if self._passthrough:
+            return x
+        if self._soxr_stream is not None:
+            y = self._soxr_stream.resample_chunk(x, last=False)
+            return np.ascontiguousarray(y, dtype=np.float32)
+        if self._scipy_resample_poly is None:
+            # No resampling backend available; surface the input unchanged.
+            return x
+        return self._scipy_process(x, final=False)
+
+    # ── scipy fallback internals ────────────────────────────────────────
+    def _scipy_process(self, x: np.ndarray, *, final: bool) -> np.ndarray:
+        """Stream one input chunk through the scipy fallback.
+
+        Reasoning:
+          * For an input stream of total length L, one-shot ``resample_poly``
+            produces ``ceil(L * up / down)`` output samples. Output sample k
+            corresponds to input position ``k * down / up``; for the simple
+            ratios we use (``gcd``-reduced), ``up = 1`` ⇒ output k is at
+            input position ``k * down``, and in general output index k uses
+            filter taps centered around input position ``k * down / up``.
+          * The streamed output samples we emit across all calls form a
+            strict prefix of that grid. We track ``self._scipy_emitted_out``
+            (number of output samples already emitted, == next output index
+            to emit) and an input buffer (sliding window) keyed by absolute
+            input position.
+        """
+        assert self._scipy_resample_poly is not None
+        self._scipy_started = True
+        if x.size > 0:
+            self._scipy_in_buf = (
+                np.concatenate([self._scipy_in_buf, x])
+                if self._scipy_in_buf.size > 0
+                else x.copy()
+            )
+
+        total_in_len = self._scipy_in_buf_start_abs + self._scipy_in_buf.size
+
+        # How many output samples in TOTAL should be emitted by the end of
+        # this call? On non-final calls we conservatively stop where we
+        # still have ``tail_in`` future input samples available for the FIR
+        # right wing. On the final call we emit every output sample of the
+        # one-shot resample.
+        if final:
+            target_total_out = (total_in_len * self._up + self._down - 1) // self._down
+        else:
+            # Output sample k uses input around position ``k * down / up``.
+            # The largest k for which ``k * down / up + tail_in <= total_in_len``
+            # is ``floor((total_in_len - tail_in) * up / down)``.
+            safe_input_len = total_in_len - self._tail_in
+            if safe_input_len <= 0:
+                return np.zeros(0, dtype=np.float32)
+            target_total_out = (safe_input_len * self._up) // self._down
+
+        if target_total_out <= self._scipy_emitted_out:
+            return np.zeros(0, dtype=np.float32)
+
+        # Slice of the input buffer to feed resample_poly. We need enough
+        # left context (``ctx_in`` samples before the first output sample's
+        # input center) and the entire forward range covering the last
+        # output sample we plan to emit on this call.
+        first_emit_in_pos = (self._scipy_emitted_out * self._down) // self._up
+        last_emit_in_pos = ((target_total_out - 1) * self._down) // self._up
+        ctx_start_abs = max(
+            self._scipy_in_buf_start_abs,
+            first_emit_in_pos - self._ctx_in,
+        )
+        # Align ctx_start to a multiple of ``down`` for clean index math.
+        ctx_start_abs = (ctx_start_abs // self._down) * self._down
+        ctx_start_abs = max(ctx_start_abs, self._scipy_in_buf_start_abs)
+
+        if final:
+            slice_end_abs = total_in_len
+        else:
+            slice_end_abs = min(total_in_len, last_emit_in_pos + 1 + self._tail_in)
+        slice_start_local = ctx_start_abs - self._scipy_in_buf_start_abs
+        slice_end_local = slice_end_abs - self._scipy_in_buf_start_abs
+        segment = self._scipy_in_buf[slice_start_local:slice_end_local]
+        if segment.size == 0:
+            return np.zeros(0, dtype=np.float32)
+
+        y_full = self._scipy_resample_poly(
+            segment, self._up, self._down, padtype="line"
+        ).astype(np.float32)
+
+        # Output index k of y_full corresponds to absolute output index
+        # ``(ctx_start_abs * up) // down + k`` (because ctx_start_abs is a
+        # multiple of ``down`` and ``up / down`` is reduced).
+        local_offset = (ctx_start_abs * self._up) // self._down
+        start_local = self._scipy_emitted_out - local_offset
+        end_local = target_total_out - local_offset
+        if start_local < 0 or end_local > y_full.size:
+            # Defensive: should not occur with the invariants above.
+            start_local = max(0, start_local)
+            end_local = min(y_full.size, end_local)
+        if end_local <= start_local:
+            return np.zeros(0, dtype=np.float32)
+        y_out = y_full[start_local:end_local]
+        self._scipy_emitted_out = target_total_out
+
+        # Trim the buffer: keep enough left context for the next call.
+        next_first_emit_in_pos = (self._scipy_emitted_out * self._down) // self._up
+        keep_from_abs = max(
+            self._scipy_in_buf_start_abs,
+            next_first_emit_in_pos - self._ctx_in,
+        )
+        keep_from_abs = (keep_from_abs // self._down) * self._down
+        drop = keep_from_abs - self._scipy_in_buf_start_abs
+        if drop > 0:
+            self._scipy_in_buf = self._scipy_in_buf[drop:].copy()
+            self._scipy_in_buf_start_abs = keep_from_abs
+
+        return np.clip(y_out, -1.0, 1.0)
+
+    def flush(self) -> np.ndarray:
+        """Emit residual output samples held in the resampler's internal buffer."""
+        if self._passthrough:
+            return np.zeros(0, dtype=np.float32)
+        if self._soxr_stream is not None:
+            y = self._soxr_stream.resample_chunk(
+                np.zeros(0, dtype=np.float32), last=True
+            )
+            return np.ascontiguousarray(y, dtype=np.float32)
+        if self._scipy_resample_poly is None or not self._scipy_started:
+            return np.zeros(0, dtype=np.float32)
+        return self._scipy_process(np.zeros(0, dtype=np.float32), final=True)
 # ── [/PATCH] ──────────────────────────────────────────────────────────────────
 
 
@@ -1505,6 +1737,22 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         prev_count = 0
         sample_rate_val = 24000
         first_chunk = True
+        # [PATCH] Stateful streaming resampler; lazy-init once we know the
+        # engine's output sample rate. Resampling each chunk independently
+        # would leave a filter transient at every seam → audible "ticks".
+        stream_resampler: _StreamingResampler | None = None
+        # [/PATCH]
+
+        def _emit_audio_bytes(np_chunk: np.ndarray, sr: int) -> bytes:
+            audio_obj = CreateAudio(
+                audio_tensor=np_chunk,
+                sample_rate=sr,
+                response_format="pcm",
+                speed=1.0,
+                stream_format="audio",
+                base64_encode=False,
+            )
+            return self.create_audio(audio_obj).audio_data
 
         try:
             async for res in generator:
@@ -1536,9 +1784,17 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     )
                     if chunk_np.ndim > 1:
                         chunk_np = chunk_np.squeeze()
-                    # [PATCH] Resample chunk to target output sample rate before encoding
-                    chunk_np = _resample_audio(chunk_np, sample_rate_val, _OUTPUT_SAMPLE_RATE)
+                    chunk_np = np.ascontiguousarray(chunk_np, dtype=np.float32)
+                    # [PATCH] Stateful streaming resample to suppress
+                    # per-chunk filter transients ("ticking") at seams.
+                    if ENABLE_RESAMPLE:
+                        if stream_resampler is None:
+                            stream_resampler = _StreamingResampler(
+                                sample_rate_val, _OUTPUT_SAMPLE_RATE
+                            )
+                        chunk_np = stream_resampler.process(chunk_np)
                     # [/PATCH]
+                    effective_sr = _OUTPUT_SAMPLE_RATE if ENABLE_RESAMPLE else sample_rate_val
                     # For WAV format, emit header before first audio chunk
                     if response_format == "wav" and first_chunk:
                         # Assert that sample rate has been set from chunk metadata (not just default)
@@ -1546,22 +1802,25 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                         assert sr_raw is not None, (
                             "First audio chunk must include sample rate metadata for WAV streaming"
                         )
-                        # [PATCH] Use _OUTPUT_SAMPLE_RATE in WAV header
-                        wav_header = _create_wav_header(sample_rate=_OUTPUT_SAMPLE_RATE, num_channels=1, bits_per_sample=16)
+                        # [PATCH] Use effective_sr in WAV header
+                        wav_header = _create_wav_header(sample_rate=effective_sr, num_channels=1, bits_per_sample=16)
                         # [/PATCH]
                         yield wav_header
                         first_chunk = False
 
-                    # Convert audio to PCM bytes
-                    audio_obj = CreateAudio(
-                        audio_tensor=chunk_np,
-                        sample_rate=_OUTPUT_SAMPLE_RATE,  # [PATCH]
-                        response_format="pcm",
-                        speed=1.0,
-                        stream_format="audio",
-                        base64_encode=False,
-                    )
-                    yield self.create_audio(audio_obj).audio_data
+                    if chunk_np.size == 0:
+                        # Streaming resampler may withhold samples on the
+                        # very first chunks while filling its context buffer.
+                        continue
+                    yield _emit_audio_bytes(chunk_np, effective_sr)
+
+            # [PATCH] Flush any residual samples held by the streaming
+            # resampler so the tail of the audio is not truncated.
+            if ENABLE_RESAMPLE and stream_resampler is not None:
+                tail = stream_resampler.flush()
+                if tail.size > 0:
+                    yield _emit_audio_bytes(tail, _OUTPUT_SAMPLE_RATE)
+            # [/PATCH]
         except asyncio.CancelledError:
             logger.info("Streaming request %s cancelled by client", request_id)
             raise
@@ -2268,8 +2527,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             audio_tensor = audio_tensor.squeeze()
 
         # [PATCH] Resample full audio to target output sample rate
-        audio_tensor = _resample_audio(audio_tensor, sample_rate, _OUTPUT_SAMPLE_RATE)
-        sample_rate = _OUTPUT_SAMPLE_RATE
+        if ENABLE_RESAMPLE:
+            audio_tensor = _resample_audio(audio_tensor, sample_rate, _OUTPUT_SAMPLE_RATE)
+            sample_rate = _OUTPUT_SAMPLE_RATE
         # [/PATCH]
 
         audio_obj = CreateAudio(
@@ -2364,8 +2624,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 audio_tensor = audio_tensor.squeeze()
 
             # [PATCH] Resample diffusion model output to target output sample rate
-            audio_tensor = _resample_audio(audio_tensor, sample_rate, _OUTPUT_SAMPLE_RATE)
-            sample_rate = _OUTPUT_SAMPLE_RATE
+            if ENABLE_RESAMPLE:
+                audio_tensor = _resample_audio(audio_tensor, sample_rate, _OUTPUT_SAMPLE_RATE)
+                sample_rate = _OUTPUT_SAMPLE_RATE
             # [/PATCH]
 
             audio_obj = CreateAudio(

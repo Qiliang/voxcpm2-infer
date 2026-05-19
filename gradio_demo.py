@@ -31,7 +31,7 @@ from fastapi.responses import Response, StreamingResponse
 
 logger = logging.getLogger(__name__)
 
-SAMPLE_RATE = 8000
+SAMPLE_RATE = 16000
 
 # ── AudioWorklet processor (loaded in browser via Blob URL) ──────────
 WORKLET_JS = r"""
@@ -289,6 +289,7 @@ def create_app(api_base: str):
         req_id = body.get("_req_id")
         body['temperature']=0.001
         body['top_p']=1.0
+        body['voice']='chengna'
         if req_id and req_id in _pending:
             body = _pending.pop(req_id)
         logger.info("Proxy: %s", {k: (f"<{len(str(v))} chars>" if k == "ref_audio" else v) for k, v in body.items()})
